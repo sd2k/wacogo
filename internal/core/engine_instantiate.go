@@ -235,6 +235,7 @@ func (e *Engine) instantiateWithParentCfg(ctx context.Context, component *Compon
 		component: component,
 		exports:   make(map[string]exportEntry),
 		canLeave:  true,
+		async:     canon.NewAsyncState(),
 	}
 	inst.resources = NewResourceTable(inst)
 	defer func() {
@@ -750,8 +751,22 @@ func (s *instantiationState) buildLiftedFunc(
 		CoreFunc:   coreFn,
 		PostReturn: postReturnFn,
 	}
+	var callback api.Function
+	if options.hasCallback {
+		cb := s.coreFuncs[options.callback]
+		callback = cb.instance.ExportedFunction(cb.name)
+		if callback == nil {
+			return nil, fmt.Errorf("wacogo: lift: callback %q not exported by module", cb.name)
+		}
+	}
+	var async *canon.AsyncState
+	if options.async {
+		async = s.inst.async
+	}
 	fn := &Func{
 		funcType: funcType,
+		async:    async,
+		callback: callback,
 		binding: canon.NewCallBinding(
 			FuncTypeParamsAsCanon(funcType),
 			FuncTypeResultsAsCanon(funcType),
@@ -775,6 +790,9 @@ func (step *planLift) execute(_ context.Context, s *instantiationState) error {
 		return err
 	}
 	cf := s.coreFuncs[step.coreFuncIndex]
+	if step.options.async && ft != nil {
+		ft = &FuncType{Async: true, Params: ft.Params, Results: ft.Results}
+	}
 	fn, err := s.buildLiftedFunc(cf, step.options, ft)
 	if err != nil {
 		return err

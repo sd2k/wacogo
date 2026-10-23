@@ -348,7 +348,7 @@ func (v *Validator) addFuncType(cs *ComponentState, ft *ComponentFuncType) error
 			return fmt.Errorf("function result cannot contain a `borrow` type")
 		}
 	}
-	id := v.arena.pushFuncType(FuncTypeDesc{Params: params, Results: results})
+	id := v.arena.pushFuncType(FuncTypeDesc{Async: ft.Async, Params: params, Results: results})
 	if v.arena.FuncTypeSizes[id] > MaxEffectiveTypeSize {
 		return fmt.Errorf("effective type size exceeds the limit")
 	}

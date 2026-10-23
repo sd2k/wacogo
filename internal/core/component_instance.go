@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/partite-ai/wacogo/internal/canon"
 	"github.com/partite-ai/wacogo/wasmparser"
 )
 
@@ -38,6 +39,10 @@ type ComponentInstance struct {
 	// externTable, when non-nil, supplies LookupExtern. Set from
 	// InstanceSpec.ExternTable at construction time.
 	externTable ExternTable
+
+	// async is the async-ABI state (subtasks, waitable sets, current
+	// task) of a wasm-loaded instance. Nil for other instances.
+	async *canon.AsyncState
 }
 
 type instanceCloser interface {

@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/partite-ai/wacogo/internal/canon"
-	"github.com/tetratelabs/wazero/api"
 )
 
 // execLowerWithGoAdapter creates a cross-component adapter via canon.Host.BuildAdapter.
@@ -13,40 +12,26 @@ import (
 // using a pre-compiled transfer plan. Caller options come from the lower step;
 // the callee side comes from fn.Callee().
 func (s *instantiationState) execLowerWithGoAdapter(ctx context.Context, step planLower, fn *ExportedFunc) error {
-	var callerMem api.Memory
-	if step.options.hasMemory {
-		if int(step.options.memory) >= len(s.coreMemories) {
-			return fmt.Errorf("wacogo: lower: memory option index %d out of range", step.options.memory)
-		}
-		cm := s.coreMemories[step.options.memory]
-		callerMem = cm.instance.ExportedMemory(cm.name)
-		if callerMem == nil {
-			return fmt.Errorf("wacogo: lower: memory %q not exported by module", cm.name)
-		}
+	caller, err := s.callerSide(step.options, "lower")
+	if err != nil {
+		return err
 	}
 
-	var callerRealloc api.Function
-	var callerReallocModName, callerReallocFnExport string
-	if step.options.hasRealloc {
-		if int(step.options.realloc) >= len(s.coreFuncs) {
-			return fmt.Errorf("wacogo: lower: realloc option index %d out of range", step.options.realloc)
+	if fn.goFn != nil {
+		baseName := fmt.Sprintf("wacogo_golower_%s_%d", sanitizeName(fn.Name), instanceCounter.Add(1))
+		adapter, err := s.inst.engine.canonHost.BuildHostImport(ctx, baseName, s.inst.async, caller,
+			step.options.async,
+			FuncTypeParamsAsCanon(fn.funcType),
+			FuncTypeResultsAsCanon(fn.funcType),
+			fn.goFn)
+		if err != nil {
+			return fmt.Errorf("wacogo: lower %q: %w", fn.Name, err)
 		}
-		rf := s.coreFuncs[step.options.realloc]
-		callerRealloc = rf.instance.ExportedFunction(rf.name)
-		if callerRealloc == nil {
-			return fmt.Errorf("wacogo: lower: realloc %q not exported by module", rf.name)
-		}
-		callerReallocModName = rf.instance.Name()
-		callerReallocFnExport = rf.name
+		s.addAdapter(adapter)
+		return nil
 	}
-
-	caller := canon.CallSide{
-		Instance:        canonInstanceView{i: s.inst},
-		Memory:          callerMem,
-		Realloc:         callerRealloc,
-		StringEncoding:  step.options.stringEncoding,
-		ReallocModName:  callerReallocModName,
-		ReallocFnExport: callerReallocFnExport,
+	if step.options.async {
+		return fmt.Errorf("wacogo: lower %q: async lowering is only supported for Go functions", fn.Name)
 	}
 
 	callee := fn.binding.Callee()
@@ -70,6 +55,87 @@ func (s *instantiationState) execLowerWithGoAdapter(ctx context.Context, step pl
 		instance: adapter.Module,
 		name:     adapter.Name,
 	})
+	return nil
+}
+
+// callerSide resolves a lift/lower/task.return's memory, realloc and
+// string encoding options against this instantiation.
+func (s *instantiationState) callerSide(opts canonicalOptions, op string) (canon.CallSide, error) {
+	side := canon.CallSide{
+		Instance:       canonInstanceView{i: s.inst},
+		StringEncoding: opts.stringEncoding,
+	}
+	if opts.hasMemory {
+		if int(opts.memory) >= len(s.coreMemories) {
+			return side, fmt.Errorf("wacogo: %s: memory option index %d out of range", op, opts.memory)
+		}
+		cm := s.coreMemories[opts.memory]
+		side.Memory = cm.instance.ExportedMemory(cm.name)
+		if side.Memory == nil {
+			return side, fmt.Errorf("wacogo: %s: memory %q not exported by module", op, cm.name)
+		}
+	}
+	if opts.hasRealloc {
+		if int(opts.realloc) >= len(s.coreFuncs) {
+			return side, fmt.Errorf("wacogo: %s: realloc option index %d out of range", op, opts.realloc)
+		}
+		rf := s.coreFuncs[opts.realloc]
+		side.Realloc = rf.instance.ExportedFunction(rf.name)
+		if side.Realloc == nil {
+			return side, fmt.Errorf("wacogo: %s: realloc %q not exported by module", op, rf.name)
+		}
+		side.ReallocModName = rf.instance.Name()
+		side.ReallocFnExport = rf.name
+	}
+	return side, nil
+}
+
+// addAdapter records adapter as owned and appends its function to the
+// core function index space.
+func (s *instantiationState) addAdapter(adapter *canon.CallAdapter) {
+	s.inst.owned = append(s.inst.owned, adapter)
+	s.coreFuncs = append(s.coreFuncs, coreFunc{instance: adapter.Module, name: adapter.Name})
+}
+
+func (step *planTaskReturn) execute(ctx context.Context, s *instantiationState) error {
+	side, err := s.callerSide(step.options, "task.return")
+	if err != nil {
+		return err
+	}
+	rc := &resolverCtx{inst: s.inst, imports: s.imports, state: s}
+	results := make([]canon.Type, len(step.results))
+	for i, r := range step.results {
+		t := r.resolve(rc)
+		if t == nil {
+			return fmt.Errorf("wacogo: task.return: unresolved result type")
+		}
+		results[i] = canonType{t: t}
+	}
+	adapter, err := s.inst.engine.canonHost.BuildTaskReturn(ctx,
+		fmt.Sprintf("wacogo_taskreturn_%d", instanceCounter.Add(1)), s.inst.async, side, results)
+	if err != nil {
+		return fmt.Errorf("wacogo: task.return: %w", err)
+	}
+	s.addAdapter(adapter)
+	return nil
+}
+
+func (step *planAsyncBuiltin) execute(ctx context.Context, s *instantiationState) error {
+	h := s.inst.engine.canonHost
+	build := map[asyncBuiltin]func(context.Context, string, *canon.AsyncState) (*canon.CallAdapter, error){
+		builtinContextGet:      h.BuildContextGet,
+		builtinContextSet:      h.BuildContextSet,
+		builtinSubtaskCancel:   h.BuildSubtaskCancel,
+		builtinSubtaskDrop:     h.BuildSubtaskDrop,
+		builtinWaitableSetNew:  h.BuildWaitableSetNew,
+		builtinWaitableSetDrop: h.BuildWaitableSetDrop,
+		builtinWaitableJoin:    h.BuildWaitableJoin,
+	}[step.kind]
+	adapter, err := build(ctx, fmt.Sprintf("wacogo_async_%d", instanceCounter.Add(1)), s.inst.async)
+	if err != nil {
+		return fmt.Errorf("wacogo: async built-in: %w", err)
+	}
+	s.addAdapter(adapter)
 	return nil
 }
 

@@ -132,7 +132,7 @@ func buildComponentTypeResolver(ct wasmparser.ComponentTypeDef) typeResolver {
 		for i, r := range t.Results {
 			results[i] = funcResolverParam{name: r.Name, t: componentValTypeResolver(r.Type)}
 		}
-		return funcResolver{params: params, results: results}
+		return funcResolver{async: t.Async, params: params, results: results}
 	case *wasmparser.ResourceType:
 		rr := resourceResolver{}
 		if t.Dtor.Valid {

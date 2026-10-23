@@ -14,6 +14,9 @@ import (
 type loadInstanceInfo struct {
 	importName string
 	component  *Component
+	// primExports maps the type exports an imported instance's declared
+	// type defines as `(eq <primitive>)` to that primitive.
+	primExports map[string]Type
 }
 
 // loadScope tracks the spec-defined index spaces of the component being loaded.
@@ -77,6 +80,10 @@ type componentLoader struct {
 	// way to preserve existing planResourceDrop semantics.
 	resourceDtors map[uint32]uint32
 
+	// instanceTypePrims maps an instance TypeID to its primitive type
+	// exports (see primitiveTypeExports).
+	instanceTypePrims map[uint32]map[string]Type
+
 	// typeResolvers accumulates one entry per allocated TypeID in declaration
 	// order (type section entries, SortType aliases, and direct type imports).
 	// Copied to Component.typeResolvers at buildComponent time. The current
@@ -125,8 +132,9 @@ func (e *Engine) loadComponentFromParser(ctx context.Context, parser *wasmparser
 			outerModuleClosures:    make(map[int]outerRef),
 			outerComponentClosures: make(map[int]outerRef),
 		},
-		parser:        parser,
-		resourceDtors: make(map[uint32]uint32),
+		parser:            parser,
+		resourceDtors:     make(map[uint32]uint32),
+		instanceTypePrims: make(map[uint32]map[string]Type),
 	}
 
 	for {
@@ -295,6 +303,11 @@ func (l *componentLoader) processTypeSection(sec *wasmparser.ComponentTypeSectio
 		if rt, ok := item.(*wasmparser.ResourceType); ok && rt.Dtor.Valid {
 			l.resourceDtors[uint32(len(l.typeResolvers))] = rt.Dtor.Value
 		}
+		if it, ok := item.(*wasmparser.InstanceTypeDecl); ok {
+			if prims := primitiveTypeExports(it); len(prims) > 0 {
+				l.instanceTypePrims[uint32(len(l.typeResolvers))] = prims
+			}
+		}
 		l.allocType(buildComponentTypeResolver(item))
 	}
 	return nil
@@ -328,6 +341,29 @@ func (l *componentLoader) processCanonicalSection(sec *wasmparser.ComponentCanon
 			l.plan = append(l.plan, &planResourceDrop{typeID: cf.TypeIndex, dtorFuncIndex: dtorIdx})
 		case wasmparser.CanonResourceRep:
 			l.plan = append(l.plan, &planResourceRep{typeID: cf.TypeIndex})
+		case wasmparser.CanonTaskReturn:
+			results := make([]typeResolver, len(cf.Results))
+			for i, r := range cf.Results {
+				results[i] = componentValTypeResolver(r.Type)
+			}
+			l.plan = append(l.plan, &planTaskReturn{results: results, options: mapCanonicalOptions(cf.Options)})
+		case wasmparser.CanonContextGet:
+			l.plan = append(l.plan, &planAsyncBuiltin{kind: builtinContextGet})
+		case wasmparser.CanonContextSet:
+			l.plan = append(l.plan, &planAsyncBuiltin{kind: builtinContextSet})
+		case wasmparser.CanonSubtaskCancel:
+			if cf.Async {
+				return fmt.Errorf("wacogo: subtask.cancel async is not supported")
+			}
+			l.plan = append(l.plan, &planAsyncBuiltin{kind: builtinSubtaskCancel})
+		case wasmparser.CanonSubtaskDrop:
+			l.plan = append(l.plan, &planAsyncBuiltin{kind: builtinSubtaskDrop})
+		case wasmparser.CanonWaitableSetNew:
+			l.plan = append(l.plan, &planAsyncBuiltin{kind: builtinWaitableSetNew})
+		case wasmparser.CanonWaitableSetDrop:
+			l.plan = append(l.plan, &planAsyncBuiltin{kind: builtinWaitableSetDrop})
+		case wasmparser.CanonWaitableJoin:
+			l.plan = append(l.plan, &planAsyncBuiltin{kind: builtinWaitableJoin})
 		default:
 			panic(fmt.Sprintf("wacogo: unknown canonical item %T", item))
 		}
@@ -358,10 +394,62 @@ func (l *componentLoader) processAliasSection(sec *wasmparser.ComponentAliasSect
 	return nil
 }
 
+// primitiveTypeExports returns the type exports of it that are declared
+// equal to a primitive type, such as WASI's `type duration = u64`.
+func primitiveTypeExports(it *wasmparser.InstanceTypeDecl) map[string]Type {
+	var local []Type // the decl's type index space; nil for non-primitives
+	var out map[string]Type
+	for _, d := range it.Declarations {
+		switch d := d.(type) {
+		case wasmparser.InstanceDeclType:
+			var t Type
+			if e, ok := d.Type.(*wasmparser.ComponentDefinedTypeEntry); ok {
+				if p, ok := e.Type.(wasmparser.PrimitiveValType); ok {
+					t = primitiveTypeFor(p)
+				}
+			}
+			local = append(local, t)
+		case wasmparser.InstanceDeclAlias:
+			switch a := d.Alias.(type) {
+			case wasmparser.AliasOuter:
+				if a.Kind == wasmparser.OuterAliasKindType {
+					local = append(local, nil)
+				}
+			case wasmparser.AliasInstanceExport:
+				if a.Kind == wasmparser.ExternalKindType {
+					local = append(local, nil)
+				}
+			}
+		case wasmparser.InstanceDeclExport:
+			if d.Export.Kind != wasmparser.ExternalKindType {
+				continue
+			}
+			var t Type
+			if tr, ok := d.Export.AscribedType.Value.(wasmparser.TypeRefType); ok {
+				if eq, ok := tr.Bounds.(wasmparser.TypeBoundsEq); ok && int(eq.Index) < len(local) {
+					t = local[eq.Index]
+				}
+			}
+			if t != nil {
+				if out == nil {
+					out = map[string]Type{}
+				}
+				out[d.Export.Name.Name] = t
+			}
+			local = append(local, t)
+		}
+	}
+	return out
+}
+
 func (l *componentLoader) processAliasInstanceExport(a wasmparser.AliasInstanceExport) {
 	sort := componentExternalKindToSort(a.Kind)
 	if sort == SortType {
-		l.allocType(instanceImportResolver{instanceIdx: a.Instance, exportName: a.Name})
+		var fallback Type
+		if int(a.Instance) < len(l.scope.componentInstances) {
+			fallback = l.scope.componentInstances[a.Instance].primExports[a.Name]
+		}
+		l.allocType(instanceImportResolver{instanceIdx: a.Instance, exportName: a.Name, fallback: fallback})
 		return
 	}
 	alias := &planAlias{
@@ -535,9 +623,11 @@ func (l *componentLoader) processImportSection(sec *wasmparser.ValidatedComponen
 				name:         item.Import.Name.Name,
 				runtimeEmpty: item.IsInstanceRuntimeEmpty(),
 			})
-			l.scope.componentInstances = append(l.scope.componentInstances, loadInstanceInfo{
-				importName: item.Import.Name.Name,
-			})
+			info := loadInstanceInfo{importName: item.Import.Name.Name}
+			if tr, ok := item.Import.Type.(wasmparser.TypeRefInstance); ok {
+				info.primExports = l.instanceTypePrims[tr.Index]
+			}
+			l.scope.componentInstances = append(l.scope.componentInstances, info)
 		case SortCoreModule:
 			idx := uint32(len(l.scope.compiledModules))
 			l.scope.compiledModules = append(l.scope.compiledModules, CompiledModule{})
@@ -643,6 +733,11 @@ func mapCanonicalOptions(opts []wasmparser.CanonicalOption) canonicalOptions {
 		case wasmparser.CanonOptPostReturn:
 			co.postReturn = o.Index
 			co.hasPostReturn = true
+		case wasmparser.CanonOptAsync:
+			co.async = true
+		case wasmparser.CanonOptCallback:
+			co.callback = o.Index
+			co.hasCallback = true
 		}
 	}
 	return co

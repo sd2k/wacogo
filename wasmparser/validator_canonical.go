@@ -36,6 +36,20 @@ func (v *Validator) addCanonical(cs *ComponentState, cf CanonicalFunction) error
 		return v.canonResourceDrop(cs, c)
 	case CanonResourceRep:
 		return v.canonResourceRep(cs, c)
+	case CanonTaskReturn:
+		return v.canonTaskReturn(cs, c)
+	case CanonContextGet:
+		return v.pushBuiltin(cs, CoreFuncTypeDesc{Results: []CoreValType{contextCoreType(c.Type)}}, c.Index == 0, "context.get")
+	case CanonContextSet:
+		return v.pushBuiltin(cs, CoreFuncTypeDesc{Params: []CoreValType{contextCoreType(c.Type)}}, c.Index == 0, "context.set")
+	case CanonSubtaskCancel:
+		return v.pushBuiltin(cs, CoreFuncTypeDesc{Params: i32s(1), Results: i32s(1)}, true, "")
+	case CanonSubtaskDrop, CanonWaitableSetDrop:
+		return v.pushBuiltin(cs, CoreFuncTypeDesc{Params: i32s(1)}, true, "")
+	case CanonWaitableSetNew:
+		return v.pushBuiltin(cs, CoreFuncTypeDesc{Results: i32s(1)}, true, "")
+	case CanonWaitableJoin:
+		return v.pushBuiltin(cs, CoreFuncTypeDesc{Params: i32s(2)}, true, "")
 	default:
 		return fmt.Errorf("unknown canonical function %T", cf)
 	}
@@ -62,6 +76,19 @@ func (v *Validator) canonLift(cs *ComponentState, c CanonLift) error {
 	opts, err := v.checkCanonOptions(cs, c.Options, true)
 	if err != nil {
 		return err
+	}
+
+	if opts.async != funcType.Async && !opts.async {
+		return fmt.Errorf("async function type requires the `async` canonical option")
+	}
+	if opts.hasCallback {
+		if !opts.async {
+			return fmt.Errorf("canonical option `callback` requires `async`")
+		}
+		ct := v.arena.CoreFuncTypes[opts.callbackFuncID]
+		if !coreValTypesEqual(ct.Params, i32s(3)) || !coreValTypesEqual(ct.Results, i32s(1)) {
+			return fmt.Errorf("canonical option `callback` uses a core function with an incorrect signature")
+		}
 	}
 
 	// Check memory/realloc requirements based on the function type
@@ -93,7 +120,7 @@ func (v *Validator) canonLift(cs *ComponentState, c CanonLift) error {
 
 	// Verify the core function's signature matches the canonical lowering
 	// of the component function type being lifted to.
-	expected := v.flattenFuncType(&funcType, true)
+	expected := v.flattenFuncType(&funcType, true, opts)
 	if !coreValTypesEqual(expected.Params, actual.Params) {
 		return fmt.Errorf("lowered parameter types %s do not match parameter types %s",
 			formatCoreValTypes(expected.Params), formatCoreValTypes(actual.Params))
@@ -141,7 +168,7 @@ func (v *Validator) canonLower(cs *ComponentState, c CanonLower) error {
 	}
 
 	// Lower produces a core function — compute the lowered signature
-	lowered := v.flattenFuncType(&funcType, false)
+	lowered := v.flattenFuncType(&funcType, false, opts)
 	loweredType := v.arena.pushCoreFuncType(lowered)
 	cs.coreFuncs = append(cs.coreFuncs, loweredType)
 	return nil
@@ -219,8 +246,63 @@ func (v *Validator) canonResourceRep(cs *ComponentState, c CanonResourceRep) err
 	return nil
 }
 
+func (v *Validator) canonTaskReturn(cs *ComponentState, c CanonTaskReturn) error {
+	results := make([]FuncParamDesc, len(c.Results))
+	for i, r := range c.Results {
+		ivt, err := internalValTypeFromParsed(r.Type, cs)
+		if err != nil {
+			return err
+		}
+		results[i] = FuncParamDesc{Type: ivt}
+	}
+	if _, err := v.checkCanonOptions(cs, c.Options, false); err != nil {
+		return err
+	}
+	// task.return takes the result values as flat params, going indirect
+	// past maxFlatParams like a sync lift's params.
+	ft := FuncTypeDesc{Params: results}
+	var params []CoreValType
+	if v.flatParamCount(&ft) <= maxFlatParams {
+		for _, r := range results {
+			params = append(params, v.flattenToCoreTypes(r.Type)...)
+		}
+	} else {
+		params = i32s(1)
+	}
+	return v.pushBuiltin(cs, CoreFuncTypeDesc{Params: params}, true, "")
+}
+
+// pushBuiltin appends a canon built-in's core function type to the core
+// function index space. ok=false rejects the built-in with an error naming it.
+func (v *Validator) pushBuiltin(cs *ComponentState, ft CoreFuncTypeDesc, ok bool, name string) error {
+	if !ok {
+		return fmt.Errorf("unsupported immediate for `%s`", name)
+	}
+	cs.coreFuncs = append(cs.coreFuncs, v.arena.pushCoreFuncType(ft))
+	return nil
+}
+
+func i32s(n int) []CoreValType {
+	out := make([]CoreValType, n)
+	for i := range out {
+		out[i] = CoreValTypeI32
+	}
+	return out
+}
+
+func contextCoreType(t ValType) CoreValType {
+	if t == ValTypeI64 {
+		return CoreValTypeI64
+	}
+	return CoreValTypeI32
+}
+
 // maxFlatParams is the maximum number of core wasm params before going indirect.
 const maxFlatParams = 16
+
+// maxFlatAsyncParams is the maximum number of core wasm params of an
+// async-lowered function before going indirect.
+const maxFlatAsyncParams = 4
 
 // maxFlatResults is the maximum number of core wasm results before going indirect.
 const maxFlatResults = 1
@@ -233,6 +315,9 @@ type canonOptionsResolved struct {
 	reallocFuncID    CoreFuncTypeID
 	hasPostReturn    bool
 	postReturnFuncID CoreFuncTypeID
+	async            bool
+	hasCallback      bool
+	callbackFuncID   CoreFuncTypeID
 }
 
 // reallocParamTypes / reallocResultTypes describe the required signature of a
@@ -455,12 +540,40 @@ func (v *Validator) lowerRequirements(ft *FuncTypeDesc) (needsMemory, needsReall
 // function type. The forLift flag selects the lift vs lower convention for
 // indirect results: lift returns the result-buffer pointer as the core result,
 // while lower passes a caller-allocated pointer in as an extra param.
-func (v *Validator) flattenFuncType(ft *FuncTypeDesc, forLift bool) CoreFuncTypeDesc {
+func (v *Validator) flattenFuncType(ft *FuncTypeDesc, forLift bool, opts canonOptionsResolved) CoreFuncTypeDesc {
 	var params []CoreValType
 	var results []CoreValType
 
 	paramsFlat := v.flatParamCount(ft)
 	resultsFlat := v.flatResultCount(ft)
+
+	if opts.async {
+		// Async lift returns a packed callback code (or nothing without a
+		// callback); async lower always returns a packed subtask status and
+		// writes results through a trailing pointer.
+		maxParams := maxFlatParams
+		if !forLift {
+			maxParams = maxFlatAsyncParams
+		}
+		if paramsFlat <= maxParams {
+			for _, p := range ft.Params {
+				params = append(params, v.flattenToCoreTypes(p.Type)...)
+			}
+		} else {
+			params = []CoreValType{CoreValTypeI32}
+		}
+		if forLift {
+			if opts.hasCallback {
+				results = i32s(1)
+			}
+		} else {
+			if resultsFlat > 0 {
+				params = append(params, CoreValTypeI32)
+			}
+			results = i32s(1)
+		}
+		return CoreFuncTypeDesc{Params: params, Results: results}
+	}
 
 	if paramsFlat <= maxFlatParams {
 		for _, p := range ft.Params {
@@ -643,6 +756,24 @@ func (v *Validator) checkCanonOptions(cs *ComponentState, opts []CanonicalOption
 				return out, err
 			}
 			out.postReturnFuncID = id
+		case CanonOptAsync:
+			if out.async {
+				return out, fmt.Errorf("canonical option `async` is specified more than once")
+			}
+			out.async = true
+		case CanonOptCallback:
+			if !isLift {
+				return out, fmt.Errorf("canonical option `callback` cannot be specified for lowerings")
+			}
+			if out.hasCallback {
+				return out, fmt.Errorf("canonical option `callback` is specified more than once")
+			}
+			out.hasCallback = true
+			id, err := cs.getCoreFunc(o.Index)
+			if err != nil {
+				return out, err
+			}
+			out.callbackFuncID = id
 		}
 	}
 	return out, nil

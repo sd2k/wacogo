@@ -33,6 +33,7 @@ type FuncParam struct {
 
 // ComponentFuncType represents a component function type with params and results.
 type ComponentFuncType struct {
+	Async   bool
 	Params  []FuncParam
 	Results []FuncParam
 }
@@ -60,33 +61,42 @@ func (ft *ComponentFuncType) unmarshalBinary(r *BinaryReader) error {
 		}
 		ft.Params = append(ft.Params, FuncParam{Name: name, Type: vt})
 	}
-	// Results encoding:
-	// 0x00 valtype = single unnamed result
-	// 0x01 0x00    = named result list with 0 entries (no results)
-	resultTag, err := r.ReadByte()
+	results, err := readResultList(r)
 	if err != nil {
 		return err
+	}
+	ft.Results = results
+	return nil
+}
+
+// readResultList reads a component function result list:
+//
+//	0x00 valtype = single unnamed result
+//	0x01 0x00    = no results
+func readResultList(r *BinaryReader) ([]FuncParam, error) {
+	resultTag, err := r.ReadByte()
+	if err != nil {
+		return nil, err
 	}
 	switch resultTag {
 	case 0x00:
 		vt, err := readComponentValType(r)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		ft.Results = []FuncParam{{Name: "", Type: vt}}
+		return []FuncParam{{Name: "", Type: vt}}, nil
 	case 0x01:
 		inner, err := r.ReadByte()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if inner != 0x00 {
-			return errfAt(r.Offset()-1, "invalid leading byte (0x%x) for number of results", inner)
+			return nil, errfAt(r.Offset()-1, "invalid leading byte (0x%x) for number of results", inner)
 		}
-		ft.Results = nil
+		return nil, nil
 	default:
-		return errfAt(r.Offset()-1, "invalid leading byte (0x%x) for component function results", resultTag)
+		return nil, errfAt(r.Offset()-1, "invalid leading byte (0x%x) for component function results", resultTag)
 	}
-	return nil
 }
 
 // ResourceType represents a resource type with a representation and optional destructor.
@@ -351,10 +361,10 @@ func readComponentTypeDef(r *BinaryReader) (ComponentTypeDef, error) {
 		return nil, err
 	}
 	switch b {
-	case 0x40:
-		// Sync func type
+	case 0x40, 0x43:
+		// Sync (0x40) or async (0x43) func type
 		_, _ = r.ReadByte() // already validated by Peek
-		ft := &ComponentFuncType{}
+		ft := &ComponentFuncType{Async: b == 0x43}
 		if err := ft.unmarshalBinary(r); err != nil {
 			return nil, err
 		}

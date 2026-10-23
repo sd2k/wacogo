@@ -317,6 +317,7 @@ type VariantCaseDesc struct {
 
 // FuncTypeDesc is the resolved form of a component function type.
 type FuncTypeDesc struct {
+	Async   bool
 	Params  []FuncParamDesc
 	Results []FuncParamDesc
 }

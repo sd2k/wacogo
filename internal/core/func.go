@@ -16,6 +16,21 @@ import (
 type Func struct {
 	funcType *FuncType
 	binding  *canon.CallBinding
+
+	// async and callback are set for an async-lifted export.
+	async    *canon.AsyncState
+	callback api.Function
+
+	// goFn is set for a function implemented in Go (NewGoFunc); a guest
+	// lowering it calls goFn directly instead of going through binding.
+	goFn canon.HostFunc
+}
+
+// NewGoFunc constructs a *Func implemented by fn. A guest lowering of it
+// calls fn directly with lifted values, on a new goroutine when the guest
+// lowers it async.
+func NewGoFunc(ft *FuncType, fn canon.HostFunc) *Func {
+	return &Func{funcType: ft, goFn: fn}
 }
 
 // Type returns the component model function type.
@@ -32,6 +47,12 @@ func (f *Func) Call(ctx context.Context, args ...Val) ([]Val, error) {
 	if len(args) != len(f.funcType.Params) {
 		return nil, fmt.Errorf("wacogo: call: expected %d args, got %d",
 			len(f.funcType.Params), len(args))
+	}
+	if f.goFn != nil {
+		return f.goFn(ctx, args)
+	}
+	if f.async != nil {
+		return f.binding.CallAsync(ctx, args, f.async, f.callback)
 	}
 	return f.binding.Call(ctx, args)
 }

@@ -83,6 +83,7 @@ type funcRuntime struct {
 	exportName     string // component-level export name (user-visible)
 	stubExportName string // synthetic, unique within the stub: "__fn_<flatIdx>"
 	userFn         Func
+	goFn           GoFunc
 	userFT         *FuncType
 	hostModExport  string // import name on the stub (matches stubExportName for funcs)
 	flatParams     []byte
@@ -239,6 +240,11 @@ func (c *Component) buildFuncExports(
 		coreFT, err := buildCoreFuncType(fr.userFT, trSlice)
 		if err != nil {
 			return nil, fmt.Errorf("wacogo/host: func %q: %w", fr.exportName, err)
+		}
+		if fr.goFn != nil {
+			funcExports[i] = core.NewExportedFunc(fr.exportName,
+				core.NewGoFunc(coreFT, canon.HostFunc(fr.goFn)), c.wpFuncTypes[i])
+			continue
 		}
 		callee := canon.Callee{
 			CallSide: canon.CallSide{

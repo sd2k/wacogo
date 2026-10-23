@@ -176,6 +176,7 @@ type ResultType struct {
 
 // FuncType is a component model function type.
 type FuncType struct {
+	Async   bool
 	Params  []ParamType
 	Results []ResultType
 }

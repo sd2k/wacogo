@@ -123,6 +123,7 @@ type funcResolverParam struct {
 	t    typeResolver
 }
 type funcResolver struct {
+	async           bool
 	params, results []funcResolverParam
 }
 
@@ -148,7 +149,7 @@ func (r funcResolver) resolve(rc *resolverCtx) Type {
 		}
 		results[i] = ResultType{Name: p.name, Type: t}
 	}
-	return &FuncType{Params: params, Results: results}
+	return &FuncType{Async: r.async, Params: params, Results: results}
 }
 
 type ownResolver struct{ resource uint32 }
@@ -206,6 +207,10 @@ func (r resourceResolver) resolve(rc *resolverCtx) Type {
 type instanceImportResolver struct {
 	instanceIdx uint32
 	exportName  string
+	// fallback is the primitive the import's declared type equates the
+	// export to; used when the supplied instance does not export it (host
+	// instances do not export primitive type aliases).
+	fallback Type
 }
 
 func (r instanceImportResolver) resolve(rc *resolverCtx) Type {
@@ -220,7 +225,10 @@ func (r instanceImportResolver) resolve(rc *resolverCtx) Type {
 		// Return nil so callers can surface an instantiation-time error.
 		return nil
 	}
-	return inst.exportedType(r.exportName)
+	if t := inst.exportedType(r.exportName); t != nil {
+		return t
+	}
+	return r.fallback
 }
 
 type aliasResolver struct {

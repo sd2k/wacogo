@@ -28,6 +28,7 @@ type funcDecl struct {
 	name string
 	ty   *FuncType
 	fn   Func
+	goFn GoFunc
 }
 
 type typeDecl struct {
@@ -71,6 +72,21 @@ func NewBuilder(e *core.Engine, name string) *Builder {
 // rejected by Build.
 func (b *Builder) AddFunction(exportName string, ty *FuncType, fn Func) {
 	b.root.funcs = append(b.root.funcs, funcDecl{name: exportName, ty: ty, fn: fn})
+}
+
+// AddGoFunction declares a function export named exportName with the
+// signature ty, implemented by fn on lifted values. A wasm component
+// importing it calls fn directly; when ty is async and the component
+// lowers it async, fn runs on its own goroutine.
+func (b *Builder) AddGoFunction(exportName string, ty *FuncType, fn GoFunc) {
+	b.root.funcs = append(b.root.funcs, funcDecl{
+		name: exportName,
+		ty:   ty,
+		fn: func(context.Context, *CallContext, *ComponentInstance, []uint64) error {
+			return fmt.Errorf("wacogo/host: %s is only callable through a lowering", exportName)
+		},
+		goFn: fn,
+	})
 }
 
 // AddResource declares a host-owned resource type exported as
@@ -258,6 +274,7 @@ func buildScopeTree(b *Builder, comp *Component, root *scope) error {
 				exportName:     fd.name,
 				stubExportName: stubExportNameOf(len(comp.allFuncs), scopePath, fd.name),
 				userFn:         fd.fn,
+				goFn:           fd.goFn,
 				userFT:         fd.ty,
 				flatParams:     flatParams,
 				flatResults:    flatResults,

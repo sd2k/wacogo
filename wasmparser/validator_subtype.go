@@ -159,6 +159,9 @@ func (sc *SubtypeChecker) isFuncTypeSubtype(a, b ComponentFuncTypeID) error {
 	at := sc.aArena.FuncTypes[a]
 	bt := sc.bArena.FuncTypes[b]
 
+	if at.Async != bt.Async {
+		return fmt.Errorf("expected async=%t function, found async=%t", bt.Async, at.Async)
+	}
 	if len(at.Params) != len(bt.Params) {
 		return fmt.Errorf("expected %d parameters, found %d", len(bt.Params), len(at.Params))
 	}

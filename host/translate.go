@@ -18,6 +18,7 @@ func buildCoreFuncType(
 	trSlice []*core.TypeResource,
 ) (*core.FuncType, error) {
 	out := &core.FuncType{
+		Async:   ft.Async,
 		Params:  make([]core.ParamType, len(ft.Params)),
 		Results: make([]core.ResultType, len(ft.Results)),
 	}
@@ -735,7 +736,7 @@ func (t *instTranslator) instTranslateDefinedType(ref *TypeRef) (wasmparser.Comp
 }
 
 func (t *instTranslator) instTranslateFuncType(ft *FuncType) (wasmparser.FuncTypeDesc, error) {
-	fd := wasmparser.FuncTypeDesc{}
+	fd := wasmparser.FuncTypeDesc{Async: ft.Async}
 	for _, p := range ft.Params {
 		vt, err := t.instTranslateValType(p.Type)
 		if err != nil {

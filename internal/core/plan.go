@@ -15,6 +15,9 @@ type canonicalOptions struct {
 	hasMemory      bool
 	hasRealloc     bool
 	hasPostReturn  bool
+	async          bool
+	callback       uint32
+	hasCallback    bool
 }
 
 // planStep is the union of instantiation plan steps.
@@ -246,4 +249,27 @@ type planExportRebind struct {
 	sort        Sort
 	sourceIndex uint32
 	targetIndex int
+}
+
+// planTaskReturn builds the canon task.return built-in for one result type.
+type planTaskReturn struct {
+	results []typeResolver
+	options canonicalOptions
+}
+
+type asyncBuiltin uint8
+
+const (
+	builtinContextGet asyncBuiltin = iota
+	builtinContextSet
+	builtinSubtaskCancel
+	builtinSubtaskDrop
+	builtinWaitableSetNew
+	builtinWaitableSetDrop
+	builtinWaitableJoin
+)
+
+// planAsyncBuiltin builds an async-ABI canon built-in with no type immediate.
+type planAsyncBuiltin struct {
+	kind asyncBuiltin
 }

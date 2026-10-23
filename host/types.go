@@ -161,6 +161,8 @@ type Case struct {
 // Params and Results may each reference any TypeExpr subject to the
 // same nominal/structural/inline rules as elsewhere.
 type FuncType struct {
+	// Async declares the function as `async func`.
+	Async   bool
 	Params  []Param
 	Results []ResultDecl
 }

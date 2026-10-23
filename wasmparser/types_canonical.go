@@ -1,7 +1,10 @@
 package wasmparser
 
 // CanonicalFunction is the union of canonical function definitions.
-// Variants: CanonLift, CanonLower, CanonResourceNew, CanonResourceDrop, CanonResourceRep.
+// Variants: CanonLift, CanonLower, CanonResourceNew, CanonResourceDrop, CanonResourceRep,
+// and the async built-ins CanonTaskReturn, CanonContextGet, CanonContextSet,
+// CanonSubtaskCancel, CanonSubtaskDrop, CanonWaitableSetNew, CanonWaitableSetDrop,
+// CanonWaitableJoin.
 type CanonicalFunction interface {
 	canonicalFunction()
 }
@@ -38,8 +41,58 @@ type CanonResourceRep struct{ TypeIndex uint32 }
 
 func (CanonResourceRep) canonicalFunction() {}
 
+// CanonTaskReturn returns a result from an async-lifted export.
+type CanonTaskReturn struct {
+	Results []FuncParam
+	Options []CanonicalOption
+}
+
+func (CanonTaskReturn) canonicalFunction() {}
+
+// CanonContextGet reads a slot of the current task's context storage.
+type CanonContextGet struct {
+	Type  ValType
+	Index uint32
+}
+
+func (CanonContextGet) canonicalFunction() {}
+
+// CanonContextSet writes a slot of the current task's context storage.
+type CanonContextSet struct {
+	Type  ValType
+	Index uint32
+}
+
+func (CanonContextSet) canonicalFunction() {}
+
+// CanonSubtaskCancel requests cancellation of a subtask.
+type CanonSubtaskCancel struct{ Async bool }
+
+func (CanonSubtaskCancel) canonicalFunction() {}
+
+// CanonSubtaskDrop drops a resolved subtask.
+type CanonSubtaskDrop struct{}
+
+func (CanonSubtaskDrop) canonicalFunction() {}
+
+// CanonWaitableSetNew creates an empty waitable set.
+type CanonWaitableSetNew struct{}
+
+func (CanonWaitableSetNew) canonicalFunction() {}
+
+// CanonWaitableSetDrop drops an empty waitable set.
+type CanonWaitableSetDrop struct{}
+
+func (CanonWaitableSetDrop) canonicalFunction() {}
+
+// CanonWaitableJoin moves a waitable into a waitable set, or out of any set.
+type CanonWaitableJoin struct{}
+
+func (CanonWaitableJoin) canonicalFunction() {}
+
 // CanonicalOption is the union of canonical options.
-// Variants: CanonOptUTF8, CanonOptUTF16, CanonOptLatin1UTF16, CanonOptMemory, CanonOptRealloc, CanonOptPostReturn.
+// Variants: CanonOptUTF8, CanonOptUTF16, CanonOptLatin1UTF16, CanonOptMemory, CanonOptRealloc, CanonOptPostReturn,
+// CanonOptAsync, CanonOptCallback.
 type CanonicalOption interface {
 	canonicalOption()
 }
@@ -73,6 +126,16 @@ func (CanonOptRealloc) canonicalOption() {}
 type CanonOptPostReturn struct{ Index uint32 }
 
 func (CanonOptPostReturn) canonicalOption() {}
+
+// CanonOptAsync selects the async ABI.
+type CanonOptAsync struct{}
+
+func (CanonOptAsync) canonicalOption() {}
+
+// CanonOptCallback specifies the event-loop callback of an async lift.
+type CanonOptCallback struct{ Index uint32 }
+
+func (CanonOptCallback) canonicalOption() {}
 
 // readCanonicalOptions reads a vector of canonical options.
 func readCanonicalOptions(r *BinaryReader) ([]CanonicalOption, error) {
@@ -114,6 +177,14 @@ func readCanonicalOptions(r *BinaryReader) ([]CanonicalOption, error) {
 				return nil, err
 			}
 			opts = append(opts, CanonOptPostReturn{Index: idx})
+		case 0x06:
+			opts = append(opts, CanonOptAsync{})
+		case 0x07:
+			idx, err := r.ReadU32()
+			if err != nil {
+				return nil, err
+			}
+			opts = append(opts, CanonOptCallback{Index: idx})
 		default:
 			return nil, errfAt(r.Offset()-1, "unknown canonical option: 0x%02x", b)
 		}
@@ -189,6 +260,58 @@ func readCanonicalFunction(r *BinaryReader) (CanonicalFunction, error) {
 			return nil, err
 		}
 		return CanonResourceRep{TypeIndex: typeIdx}, nil
+	case 0x09:
+		// task.return: resultlist, options
+		results, err := readResultList(r)
+		if err != nil {
+			return nil, err
+		}
+		opts, err := readCanonicalOptions(r)
+		if err != nil {
+			return nil, err
+		}
+		return CanonTaskReturn{Results: results, Options: opts}, nil
+	case 0x0a, 0x0b:
+		// context.get / context.set: core valtype, slot index
+		tb, err := r.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		var vt ValType
+		switch tb {
+		case 0x7f:
+			vt = ValTypeI32
+		case 0x7e:
+			vt = ValTypeI64
+		default:
+			return nil, errfAt(r.Offset()-1, "invalid context value type: 0x%02x", tb)
+		}
+		idx, err := r.ReadU32()
+		if err != nil {
+			return nil, err
+		}
+		if b == 0x0a {
+			return CanonContextGet{Type: vt, Index: idx}, nil
+		}
+		return CanonContextSet{Type: vt, Index: idx}, nil
+	case 0x06:
+		// subtask.cancel: async?
+		async, err := r.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		if async > 0x01 {
+			return nil, errfAt(r.Offset()-1, "invalid async flag in subtask.cancel: 0x%02x", async)
+		}
+		return CanonSubtaskCancel{Async: async == 0x01}, nil
+	case 0x0d:
+		return CanonSubtaskDrop{}, nil
+	case 0x1f:
+		return CanonWaitableSetNew{}, nil
+	case 0x22:
+		return CanonWaitableSetDrop{}, nil
+	case 0x23:
+		return CanonWaitableJoin{}, nil
 	default:
 		return nil, errfAt(r.Offset()-1, "unknown canonical function kind: 0x%02x", b)
 	}
